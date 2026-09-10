@@ -496,12 +496,7 @@ export const ADAPTERS = [
     displayName: 'Garmin Connect',
     authType: 'credentials',
     authDocsUrl: 'https://connect.garmin.com/',
-    selfHostOnly: true,
-    selfHostDocsUrl: 'https://docs.getbased.health/guides/self-hosting#garmin-connect',
     beta: true,
-    betaHidden: true,
-    hostConfiguredOnly: true,
-    experimentalSelfHost: true,
     // No OAuth client — credentials are exchanged server-side via /api/proxy.
     apiHost: 'connect.garmin.com',
     metrics: {
