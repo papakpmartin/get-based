@@ -18,6 +18,7 @@ import { brandMarkMono } from './brand-assets.js';
 import { groupWearableAdapters, requestHostedWearableRelayConsent, withdrawHostedWearableRelayConsent } from './wearables-settings-groups.js';
 import {
   beginConnectOAuth,
+  completeConnectCredentials,
   backfillWearable,
   disconnectWearable,
   syncNow,
@@ -377,7 +378,7 @@ function renderRowAction(adapter, conn, { isPendingClient, isFileImport, isHostU
   if (isFileImport) {
     return `<button type="button" class="wearable-action-row-btn" ${wearableSettingsActionAttrs('pick-apple-health-file', {}, { stopPropagation: true })}>Import</button>`;
   }
-  if (adapter.authType === 'oauth2') {
+  if (adapter.authType === 'oauth2' || adapter.authType === 'credentials') {
     return `<button type="button" class="wearable-action-row-btn" ${wearableSettingsActionAttrs('connect', { adapter: adapter.id }, { stopPropagation: true })} aria-label="Connect ${escapeHTML(adapter.displayName)}">Connect</button>`;
   }
   return '';
@@ -672,11 +673,97 @@ async function handleWearableConnect(adapterId) {
       );
       if (!consented) return;
     }
+    if (adapter.authType === 'credentials') {
+      const creds = await promptGarminCredentials(adapter.displayName);
+      if (!creds) return; // user cancelled
+      showNotification?.(`Connecting to ${adapter.displayName}…`, 'info', 5000);
+      await completeConnectCredentials(adapterId, {
+        email: creds.email,
+        password: creds.password,
+        profileId: initiatingProfileId,
+      });
+      showNotification?.(`${adapter.displayName} connected successfully.`, 'success', 4000);
+      // Trigger backfill + re-render
+      void backfillWearable(adapterId).catch(() => {});
+      navigateWearablesDashboard();
+      return;
+    }
     beginConnectOAuth(adapterId, initiatingProfileId);
     // beginOAuth navigates away — nothing else to do here.
   } catch (e) {
     showNotification?.(`Connect failed: ${getErrorMessage(e)}`, 'error', 5000);
   }
+}
+
+/**
+ * Show a modal dialog prompting for Garmin Connect email + password.
+ * Returns {email, password} or null if the user cancelled.
+ */
+function promptGarminCredentials(displayName) {
+  return new Promise((resolve) => {
+    let overlay = document.getElementById('confirm-dialog-overlay');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = 'confirm-dialog-overlay';
+      overlay.className = 'confirm-overlay';
+      document.body.appendChild(overlay);
+    }
+    overlay.innerHTML = `<div class="confirm-dialog" role="dialog" aria-modal="true" aria-label="Connect ${escapeHTML(displayName)}">
+      <p class="confirm-message">Enter your ${escapeHTML(displayName)} credentials. Your email and password are sent securely to the server-side proxy and never stored in the browser.</p>
+      <div style="display:flex;flex-direction:column;gap:10px;margin:16px 0;">
+        <input type="email" id="garmin-email" placeholder="Email" autocomplete="username" style="padding:8px 12px;border:1px solid var(--border-color,#ccc);border-radius:6px;font-size:14px;background:var(--surface-color,#fff);color:var(--text-color,#333);" />
+        <input type="password" id="garmin-password" placeholder="Password" autocomplete="current-password" style="padding:8px 12px;border:1px solid var(--border-color,#ccc);border-radius:6px;font-size:14px;background:var(--surface-color,#fff);color:var(--text-color,#333);" />
+      </div>
+      <div class="confirm-actions">
+        <button class="confirm-btn confirm-btn-cancel" id="garmin-cancel">Cancel</button>
+        <button class="confirm-btn confirm-btn-primary" id="garmin-connect">Connect</button>
+      </div></div>`;
+    const emailInput = /** @type {HTMLInputElement | null} */ (overlay.querySelector('#garmin-email'));
+    const passwordInput = /** @type {HTMLInputElement | null} */ (overlay.querySelector('#garmin-password'));
+    const connectBtn = /** @type {HTMLButtonElement | null} */ (overlay.querySelector('#garmin-connect'));
+    const cancelBtn = /** @type {HTMLButtonElement | null} */ (overlay.querySelector('#garmin-cancel'));
+    if (!connectBtn || !cancelBtn || !emailInput || !passwordInput) {
+      resolve(null);
+      return;
+    }
+    let settled = false;
+    const cleanup = () => {
+      document.removeEventListener('keydown', onKey);
+      overlay.onclick = null;
+      delete overlay.dataset.escapeOwner;
+    };
+    const close = (result) => {
+      if (settled) return;
+      settled = true;
+      overlay.style.display = 'none';
+      overlay.innerHTML = '';
+      cleanup();
+      resolve(result);
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { close(null); }
+      if (e.key === 'Enter' && (document.activeElement === emailInput || document.activeElement === passwordInput)) {
+        const email = emailInput.value.trim();
+        const password = passwordInput.value;
+        if (email && password) close({ email, password });
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    overlay.onclick = (e) => { if (e.target === overlay) close(null); };
+    overlay.dataset.escapeOwner = 'garmin-credentials';
+    overlay.style.display = 'flex';
+    cancelBtn.onclick = () => close(null);
+    connectBtn.onclick = () => {
+      const email = emailInput.value.trim();
+      const password = passwordInput.value;
+      if (!email || !password) {
+        emailInput.focus();
+        return;
+      }
+      close({ email, password });
+    };
+    emailInput.focus();
+  });
 }
 
 function handleAppleHealthDrop(e) {
