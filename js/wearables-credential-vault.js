@@ -25,7 +25,7 @@ const LOCAL_GENERATION_PREFIX = 'labcharts-wearable-credential-generation:';
 const APP_CREDENTIAL_PROFILE_ID = 'credential-vault';
 
 export const VAULTED_CREDENTIAL_ADAPTERS = new Set([
-  'oura', 'whoop', 'withings', 'ultrahuman', 'fitbit', 'google_health', 'polar',
+  'oura', 'whoop', 'withings', 'ultrahuman', 'fitbit', 'google_health', 'polar', 'garmin',
 ]);
 
 export function usesWearableCredentialVault(adapterId) {

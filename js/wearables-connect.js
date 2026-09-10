@@ -27,6 +27,8 @@ import { fetchPolarDailyRange, fetchPolarPersonalInfo, registerPolarUser, commit
 import { beginOAuth as beginPolarOAuth, completeOAuthCallback as completePolarCallback, isPolarCallback, withFreshToken as polarWithFreshToken, DEFAULT_POLAR_SCOPES } from './wearables-polar-auth.js';
 import { fetchGoogleHealthDailyRange, fetchGoogleHealthPersonalInfo } from './wearables-google-health.js';
 import { beginOAuth as beginGoogleHealthOAuth, completeOAuthCallback as completeGoogleHealthCallback, isGoogleHealthCallback, withFreshToken as googleHealthWithFreshToken, withGoogleHealthLifecycleLock, withGoogleHealthRefreshLock, DEFAULT_GOOGLE_HEALTH_SCOPES } from './wearables-google-health-auth.js';
+import { fetchGarminDailyRange, fetchGarminPersonalInfo } from './wearables-garmin.js';
+import { beginCredentialsConnect, completeCredentialsConnect, withFreshToken as garminWithFreshToken } from './wearables-garmin-auth.js';
 import { clearLocalWearableCredential, deleteWearableCredentials, hasLocalWearableCredential, loadWearableCredentials, markLocalWearableCredential, saveWearableCredentials, usesWearableCredentialVault, wearableCredentialDisconnectedError, wearableCredentialGenerationKey } from './wearables-credential-vault.js';
 import { applyWearableDisconnectToProfile, clearPendingWearableDisconnect, pendingWearableDisconnectMetaKey } from './wearables-disconnect-recovery.js';
 import { getActiveProfileId } from './profile.js';
@@ -215,6 +217,35 @@ export function beginConnectOAuth(adapterId, profileId = getActiveProfileId()) {
   });
 }
 
+/**
+ * Begin a credentials-based wearable connect (Garmin Connect).
+ * Returns an opaque flow state the caller passes to `completeConnectCredentials`.
+ */
+export function beginConnectCredentials(adapterId, { profileId = getActiveProfileId(), email = null } = {}) {
+  const adapter = adapterById(adapterId);
+  if (!adapter) throw new Error(`Unknown adapter: ${adapterId}`);
+  if (adapter.authType !== 'credentials') throw new Error(`Adapter ${adapterId} is not credentials-based`);
+  if (isWearableRelayUnavailable(adapter)) throw new Error(SELF_HOSTED_WEARABLE_MESSAGE);
+  if (adapter.hostConfiguredOnly && !isOAuthAdapterConfigured(adapter)) {
+    throw new Error(`${adapter.displayName} requires this deployment to configure Garmin Connect server-side support.`);
+  }
+  const begin = OAUTH_DISPATCH[adapter.id]?.beginCredentials;
+  if (!begin) throw new Error(`Unsupported credentials adapter: ${adapter.id}`);
+  return begin({ profileId, email });
+}
+
+/**
+ * Complete a credentials-based connect by exchanging email + password for a
+ * session token. Returns the same shape as an OAuth completion.
+ */
+export async function completeConnectCredentials(adapterId, { email, password, profileId = null }) {
+  const adapter = adapterById(adapterId);
+  if (!adapter) throw new Error(`Unknown adapter: ${adapterId}`);
+  const complete = OAUTH_DISPATCH[adapter.id]?.completeCredentials;
+  if (!complete) throw new Error(`Unsupported credentials adapter: ${adapter.id}`);
+  return complete({ email, password, profileId });
+}
+
 // Per-adapter OAuth wiring table. Keeps the orchestrator out of vendor-specific
 // branch logic — new adapters register here once and flow through generically.
 export const OAUTH_DISPATCH = {
@@ -284,6 +315,14 @@ export const OAUTH_DISPATCH = {
     postConnect: registerPolarUser,
     commitAfterWrite: commitPolarTransactions,
     displayName: 'Polar',
+  },
+  garmin: {
+    beginCredentials: (args) => beginCredentialsConnect(args),
+    completeCredentials: (args) => completeCredentialsConnect(args),
+    withFreshToken: garminWithFreshToken,
+    fetchAccountInfo: fetchGarminPersonalInfo,
+    fetchRange: (accessToken, startDate, endDate) => fetchGarminDailyRange(accessToken, startDate, endDate),
+    displayName: 'Garmin Connect',
   },
 };
 
@@ -478,6 +517,9 @@ async function fetchRange(adapter, startDate, endDate, opts = {}) {
   if (adapter.id === 'polar') {
     // Polar needs the live connection (userId + transaction state).
     return callWithRefresh(adapter, (token) => fetchPolarDailyRange(token, startDate, endDate, getConnection('polar')));
+  }
+  if (adapter.id === 'garmin') {
+    return callWithRefresh(adapter, (token) => fetchGarminDailyRange(token, startDate, endDate));
   }
   return [];
 }

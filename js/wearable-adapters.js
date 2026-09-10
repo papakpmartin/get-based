@@ -17,7 +17,7 @@ import { isOfficialGetbasedHost } from './url-safety.js';
 // Shape — adapter:
 //   id              stable lowercase slug; persisted in L1 rows, L2 sources
 //   displayName     human label ("Oura", "WHOOP", "Apple Health")
-//   authType        'pat' | 'oauth' | 'file-import'
+//   authType        'pat' | 'oauth2' | 'credentials' | 'manual' | 'file-import'
 //   authDocsUrl     optional — where the user creates the credential
 //   apiHost         optional — vendor API host; browser-direct where supported,
 //                   otherwise available only through a self-hosted deployment
@@ -489,6 +489,38 @@ export const ADAPTERS = [
       sleep_score: { endpoint: 'v3/users/{uid}/sleep',                 field: 'sleep-score' },
     },
     accountInfo: { endpoint: 'v3/users/{uid}', identityField: 'polar-user-id' },
+  },
+
+  {
+    id: 'garmin',
+    displayName: 'Garmin Connect',
+    authType: 'credentials',
+    authDocsUrl: 'https://connect.garmin.com/',
+    selfHostOnly: true,
+    selfHostDocsUrl: 'https://docs.getbased.health/guides/self-hosting#garmin-connect',
+    beta: true,
+    betaHidden: true,
+    hostConfiguredOnly: true,
+    experimentalSelfHost: true,
+    // No OAuth client — credentials are exchanged server-side via /api/proxy.
+    apiHost: 'connect.garmin.com',
+    metrics: {
+      hrv_rmssd:       { endpoint: 'hrv-service/hrv',                    field: 'lastNightAvg' },
+      rhr:             { endpoint: 'usersummary-service/userSummary',    field: 'restingHeartRate' },
+      hr_day:          { endpoint: 'usersummary-service/userSummaryHeartRates', field: 'average' },
+      sleep_score:     { endpoint: 'wellness-service/wellness/dailySleep', field: 'sleepScore' },
+      readiness_score: { endpoint: 'training-readiness-service/readiness', field: 'readinessScore' },
+      steps:           { endpoint: 'usersummary-service/userSummary',      field: 'totalSteps' },
+      stress_high_min: { endpoint: 'wellness-service/wellness/dailyStress', field: 'highStressDurationInSeconds', transform: 'sec→min' },
+      spo2_avg:        { endpoint: 'spo2-service/spo2',                    field: 'averageSpO2' },
+      body_temp_delta: { endpoint: 'bodyservice/bodyBattery',              field: 'temperatureDelta' },
+      sleep_total_min: { endpoint: 'wellness-service/wellness/dailySleep', field: 'sleepTimeInBed', transform: 'sec→min' },
+      sleep_deep_min:  { endpoint: 'wellness-service/wellness/dailySleep', field: 'deepSleepSeconds', transform: 'sec→min' },
+      sleep_light_min: { endpoint: 'wellness-service/wellness/dailySleep', field: 'lightSleepSeconds', transform: 'sec→min' },
+      sleep_rem_min:   { endpoint: 'wellness-service/wellness/dailySleep', field: 'remSleepSeconds', transform: 'sec→min' },
+      sleep_awake_min: { endpoint: 'wellness-service/wellness/dailySleep', field: 'awakeSleepSeconds', transform: 'sec→min' },
+    },
+    accountInfo: { endpoint: 'userprofile-service/userprofile', identityField: 'emailAddress' },
   },
 
   {
