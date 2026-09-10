@@ -11,6 +11,9 @@
     "api/proxy.js": {
       "maxDuration": 190,
       "supportsCancellation": true
+    },
+    "api/garmin_auth.py": {
+      "maxDuration": 60
     }
   },
   "routes": [

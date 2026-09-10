@@ -147,6 +147,8 @@ export async function handler(req) {
     Boolean(payload.polar_token_refresh),
     Boolean(payload.google_health_token_exchange),
     Boolean(payload.google_health_token_refresh),
+    Boolean(payload.garmin_credentials),
+    Boolean(payload.garmin_token_refresh),
     payload.meteo === 'cams',
     payload.meteo === 'postal_geocode',
     Object.prototype.hasOwnProperty.call(payload, 'url'),
@@ -274,6 +276,15 @@ export async function handler(req) {
   // browser or stored in profile data.
   if (payload.google_health_token_exchange || payload.google_health_token_refresh) {
     return handleGoogleHealthTokenRequest(payload, req);
+  }
+
+  // ─── Garmin Connect server-side auth flow ────────────────────────
+  // Garmin's OAuth1 → OAuth2 exchange is driven by a Python serverless function
+  // (api/garmin_auth.py) that uses the `garth` library. The JS proxy simply
+  // forwards credential and refresh payloads so email/password never reach
+  // the browser; generic connect/connectapi data requests pass through below.
+  if (payload.garmin_credentials || payload.garmin_token_refresh) {
+    return handleGarminAuthRequest(payload, req);
   }
 
   // ─── CAMS atmosphere relay (getbased-uvdata) ────────────────────
@@ -731,4 +742,62 @@ async function handleGoogleHealthTokenRequest(payload, req) {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: form.toString(),
   }, req, 'Google OAuth token endpoint unavailable');
+}
+
+// ─── Garmin auth handler ─────────────────────────────────────────
+// Forwards credential login and token refresh to the Python serverless function
+// that performs Garmin's OAuth1 → OAuth2 exchange. Generic connect/connectapi
+// data requests bypass this and use the standard proxy path below.
+async function handleGarminAuthRequest(payload, req) {
+  const action = payload.garmin_credentials ? 'login' : 'refresh';
+  const input = payload.garmin_credentials || payload.garmin_token_refresh;
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return new Response(JSON.stringify({ error: `garmin_${action === 'login' ? 'credentials' : 'token_refresh'} requires an object payload` }), {
+      status: 400,
+      headers: { ...corsHeaders(req), 'Content-Type': 'application/json' },
+    });
+  }
+
+  const required = action === 'login' ? ['email', 'password'] : ['refresh_token'];
+  for (const key of required) {
+    if (!input[key]) {
+      return new Response(JSON.stringify({ error: `garmin_${action === 'login' ? 'credentials' : 'token_refresh'} requires ${key}` }), {
+        status: 400,
+        headers: { ...corsHeaders(req), 'Content-Type': 'application/json' },
+      });
+    }
+  }
+
+  const body = JSON.stringify({ action, ...input });
+  const target = garminAuthInternalUrl(req);
+  try {
+    const upstream = await fetch(target, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+      signal: req.signal,
+    });
+    const upstreamBody = await readResponseTextWithCap(upstream, PROXY_MAX_CREDENTIAL_RESPONSE_BYTES);
+    return new Response(upstreamBody, {
+      status: upstream.status,
+      headers: {
+        ...corsHeaders(req),
+        'Content-Type': upstream.headers.get('content-type') || 'application/json',
+      },
+    });
+  } catch (error) {
+    return proxyUpstreamErrorResponse(req, error, 'Garmin auth service unavailable');
+  }
+}
+
+function garminAuthInternalUrl(req) {
+  const deploymentUrl = req.headers.get('x-vercel-deployment-url');
+  const envUrl = typeof process !== 'undefined' ? process.env?.VERCEL_URL : undefined;
+  if (deploymentUrl) return `https://${deploymentUrl}/api/garmin_auth.py`;
+  if (envUrl) return `https://${envUrl}/api/garmin_auth.py`;
+  try {
+    return new URL('/api/garmin_auth.py', new URL(req.url).origin).href;
+  } catch {
+    return '/api/garmin_auth.py';
+  }
 }
