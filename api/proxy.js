@@ -963,6 +963,7 @@ async function garminLogin(email, password) {
           locale: 'en-US',
           service: serviceUrl,
         },
+        mfa_method: mfaInfo.mfaLastMethodUsed || 'email',
       })).toString('base64'),
     };
   }
@@ -1046,13 +1047,17 @@ async function garminCompleteMfa(sessionState, mfaCode) {
     }),
   }, cookies);
 
-  const mfaBody = await mfaRes.json().catch(() => ({}));
+  const mfaText = await mfaRes.text();
+  let mfaBody;
+  try { mfaBody = JSON.parse(mfaText); } catch { mfaBody = {}; }
+  console.log('[garmin] MFA verify response:', mfaRes.status, 'type:', mfaBody?.responseStatus?.type, 'body:', mfaText.slice(0, 300));
   const respType = mfaBody?.responseStatus?.type;
 
   if (respType !== 'SUCCESSFUL') {
     const detail = mfaBody?.responseStatus?.message || respType || 'unknown';
-    const err = new Error(`Garmin MFA verification failed: ${detail}`);
+    const err = new Error(`Garmin MFA verification failed: ${detail} (body: ${mfaText.slice(0, 200)})`);
     err.status = 401;
+    err.garminStep = 'mfa_verify';
     throw err;
   }
 
