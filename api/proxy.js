@@ -148,6 +148,7 @@ export async function handler(req) {
     Boolean(payload.google_health_token_exchange),
     Boolean(payload.google_health_token_refresh),
     Boolean(payload.garmin_credentials),
+    Boolean(payload.garmin_mfa),
     Boolean(payload.garmin_token_refresh),
     payload.meteo === 'cams',
     payload.meteo === 'postal_geocode',
@@ -279,11 +280,11 @@ export async function handler(req) {
   }
 
   // ─── Garmin Connect server-side auth flow ────────────────────────
-  // Garmin's OAuth1 → OAuth2 exchange is driven by a Python serverless function
-  // (api/garmin_auth.py) that uses the `garth` library. The JS proxy simply
-  // forwards credential and refresh payloads so email/password never reach
-  // the browser; generic connect/connectapi data requests pass through below.
-  if (payload.garmin_credentials || payload.garmin_token_refresh) {
+  // Garmin has no OAuth2 browser flow; email/password login (plus MFA
+  // verify and token refresh) is performed server-side here, so credentials
+  // never pass through the browser. Generic connect/connectapi data requests
+  // pass through below.
+  if (payload.garmin_credentials || payload.garmin_mfa || payload.garmin_token_refresh) {
     return handleGarminAuthRequest(payload, req);
   }
 
