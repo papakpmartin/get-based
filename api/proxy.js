@@ -840,13 +840,16 @@ function refreshTokenToOAuth1(refreshToken) {
 
 async function garminLogin(email, password) {
   const cookies = new GarminCookieJar();
+  console.log('[garmin] step 0: fetching OAuth consumer...');
   const consumer = await getGarminConsumer();
+  console.log('[garmin] step 0: got consumer key:', consumer?.consumer_key?.slice(0, 8) + '...');
   const serviceUrl = `https://mobile.integration.${GARMIN_DOMAIN}/gcm/android`;
 
   // Step 1: GET SSO sign-in page (sets cookies)
+  console.log('[garmin] step 1: GET SSO sign-in page...');
   const ssoUrl = new URL(`https://sso.${GARMIN_DOMAIN}/mobile/sso/en/sign-in`);
   ssoUrl.searchParams.set('clientId', GARMIN_CLIENT_ID);
-  await garminFetch(ssoUrl.href, { method: 'GET' }, cookies, {
+  const ssoRes = await garminFetch(ssoUrl.href, { method: 'GET' }, cookies, {
     'User-Agent': GARMIN_SSO_UA,
     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
@@ -854,8 +857,10 @@ async function garminLogin(email, password) {
     'Sec-Fetch-Dest': 'document',
     'Sec-Fetch-Site': 'none',
   });
+  console.log('[garmin] step 1: SSO page status:', ssoRes.status, 'cookies:', cookies.map.size);
 
   // Step 2: POST credentials to SSO login API
+  console.log('[garmin] step 2: POST credentials to SSO login...');
   const loginUrl = new URL(`https://sso.${GARMIN_DOMAIN}/mobile/api/login`);
   loginUrl.searchParams.set('clientId', GARMIN_CLIENT_ID);
   loginUrl.searchParams.set('locale', 'en-US');
@@ -871,8 +876,10 @@ async function garminLogin(email, password) {
     },
     body: JSON.stringify({ username: email, password, rememberMe: false, captchaToken: '' }),
   }, cookies);
+  console.log('[garmin] step 2: login response status:', loginRes.status, 'cookies:', cookies.map.size);
 
   const loginBody = await loginRes.json().catch(() => ({}));
+  console.log('[garmin] step 2: response type:', loginBody?.responseStatus?.type, 'has ticket:', !!loginBody?.serviceTicketId);
   const respType = loginBody?.responseStatus?.type;
 
   if (respType === 'SUCCESSFUL') {
@@ -938,6 +945,7 @@ async function garminLogin(email, password) {
 
   if (respType === 'MFA_REQUIRED') {
     const mfaInfo = loginBody?.customerMfaInfo || {};
+    console.log('[garmin] MFA required, method:', mfaInfo.mfaLastMethodUsed || 'email');
     return {
       mfa_required: true,
       mfa_method: mfaInfo.mfaLastMethodUsed || 'email',
@@ -953,12 +961,14 @@ async function garminLogin(email, password) {
   }
 
   if (loginRes.status === 401 || respType === 'INVALID_CREDENTIALS') {
+    console.log('[garmin] invalid credentials');
     const err = new Error('Invalid Garmin credentials.');
     err.status = 401;
     throw err;
   }
 
   const detail = loginBody?.responseStatus?.message || respType || 'unknown';
+  console.error('[garmin] SSO error:', detail, 'full body:', JSON.stringify(loginBody).slice(0, 500));
   const err = new Error(`Garmin SSO error: ${detail}`);
   err.status = 502;
   throw err;
