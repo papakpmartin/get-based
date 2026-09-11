@@ -700,6 +700,7 @@ async function handleWearableConnect(adapterId) {
       if (!result.ok) {
         const errMsg = typeof result.error === 'string' ? result.error : JSON.stringify(result.error) || 'Unknown error';
         console.error('[garmin] connect failed:', result);
+        if (result.debug) console.error('[garmin] debug:', result.debug);
         showNotification?.(`${adapter.displayName} connection failed: ${errMsg}`, 'error', 8000);
         return;
       }

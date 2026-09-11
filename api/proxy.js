@@ -966,6 +966,15 @@ async function garminLogin(email, password) {
     };
   }
 
+  if (loginRes.status === 429) {
+    const retryAfter = loginRes.headers.get('retry-after');
+    console.error('[garmin] rate limited (429). Retry-After:', retryAfter);
+    const err = new Error(`Garmin rate limit reached. ${retryAfter ? 'Retry after ' + retryAfter + 's.' : 'Try again in 10-15 minutes.'}`);
+    err.status = 429;
+    err.garminStep = 'sso_login';
+    throw err;
+  }
+
   if (loginRes.status === 401 || respType === 'INVALID_CREDENTIALS' || respType === 'INVALID_USERNAME_PASSWORD') {
     console.log('[garmin] invalid credentials');
     const err = new Error('Invalid Garmin credentials.');
@@ -1187,7 +1196,7 @@ async function handleGarminAuthRequest(payload, req) {
   } catch (error) {
     const status = error.status || 502;
     const isAuth = status === 401;
-    const message = isAuth ? 'Invalid Garmin credentials or MFA code.' : 'Garmin authentication service unavailable.';
+    const message = status === 429 ? error.message : (isAuth ? 'Invalid Garmin credentials or MFA code.' : 'Garmin authentication service unavailable.');
     console.error('[garmin_auth] ERROR:', error.message, 'status:', status, 'stack:', error.stack?.split('\n').slice(0, 3).join(' | '));
     // Include debug detail in response so we can see what Garmin returned
     // without needing Vercel dashboard access
