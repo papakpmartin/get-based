@@ -878,8 +878,10 @@ async function garminLogin(email, password) {
   }, cookies);
   console.log('[garmin] step 2: login response status:', loginRes.status, 'cookies:', cookies.map.size);
 
-  const loginBody = await loginRes.json().catch(() => ({}));
-  console.log('[garmin] step 2: response type:', loginBody?.responseStatus?.type, 'has ticket:', !!loginBody?.serviceTicketId);
+  const loginText = await loginRes.text();
+  let loginBody;
+  try { loginBody = JSON.parse(loginText); } catch { loginBody = {}; }
+  console.log('[garmin] step 2: response type:', loginBody?.responseStatus?.type, 'has ticket:', !!loginBody?.serviceTicketId, 'status:', loginRes.status, 'bodyLen:', loginText.length, 'bodyPreview:', loginText.slice(0, 200));
   const respType = loginBody?.responseStatus?.type;
 
   if (respType === 'SUCCESSFUL') {
@@ -907,7 +909,9 @@ async function garminLogin(email, password) {
     }, cookies);
     if (!oauth1Res.ok) {
       const text = await oauth1Res.text().catch(() => '');
-      throw new Error(`Garmin OAuth1 token failed: ${oauth1Res.status} ${text}`);
+      const err = new Error(`Garmin OAuth1 token failed: ${oauth1Res.status} ${text.slice(0, 200)}`);
+      err.garminStep = 'oauth1';
+      throw err;
     }
     const oauth1Params = new URLSearchParams(await oauth1Res.text());
     const oauth1 = {
@@ -937,7 +941,9 @@ async function garminLogin(email, password) {
     }, cookies);
     if (!exchangeRes.ok) {
       const text = await exchangeRes.text().catch(() => '');
-      throw new Error(`Garmin OAuth2 exchange failed: ${exchangeRes.status} ${text}`);
+      const err = new Error(`Garmin OAuth2 exchange failed: ${exchangeRes.status} ${text.slice(0, 200)}`);
+      err.garminStep = 'oauth2';
+      throw err;
     }
     const oauth2 = await exchangeRes.json();
     return { oauth1, oauth2 };
@@ -960,17 +966,19 @@ async function garminLogin(email, password) {
     };
   }
 
-  if (loginRes.status === 401 || respType === 'INVALID_CREDENTIALS') {
+  if (loginRes.status === 401 || respType === 'INVALID_CREDENTIALS' || respType === 'INVALID_USERNAME_PASSWORD') {
     console.log('[garmin] invalid credentials');
     const err = new Error('Invalid Garmin credentials.');
     err.status = 401;
+    err.garminStep = 'sso_login';
     throw err;
   }
 
   const detail = loginBody?.responseStatus?.message || respType || 'unknown';
   console.error('[garmin] SSO error:', detail, 'full body:', JSON.stringify(loginBody).slice(0, 500));
-  const err = new Error(`Garmin SSO error: ${detail}`);
+  const err = new Error(`Garmin SSO error: ${detail} (body: ${JSON.stringify(loginBody).slice(0, 300)})`);
   err.status = 502;
+  err.garminStep = 'sso_login';
   throw err;
 }
 
@@ -1178,9 +1186,19 @@ async function handleGarminAuthRequest(payload, req) {
     }
   } catch (error) {
     const status = error.status || 502;
-    const message = status === 401 ? 'Invalid Garmin credentials or MFA code.' : 'Garmin authentication service unavailable.';
-    console.error('[garmin_auth]', error.message);
-    return new Response(JSON.stringify({ error: message }), {
+    const isAuth = status === 401;
+    const message = isAuth ? 'Invalid Garmin credentials or MFA code.' : 'Garmin authentication service unavailable.';
+    console.error('[garmin_auth] ERROR:', error.message, 'status:', status, 'stack:', error.stack?.split('\n').slice(0, 3).join(' | '));
+    // Include debug detail in response so we can see what Garmin returned
+    // without needing Vercel dashboard access
+    return new Response(JSON.stringify({
+      error: message,
+      debug: {
+        step: error.garminStep || 'unknown',
+        detail: error.message,
+        status,
+      },
+    }), {
       status,
       headers: { ...corsHeaders(req), 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
     });
