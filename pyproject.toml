@@ -1,0 +1,9 @@
+[project]
+name = "getbased-garmin-auth"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "garth>=0.8.0",
+    "cloudscraper>=1.2.71",
+    "requests>=2.32.0",
+]

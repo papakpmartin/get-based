@@ -11,6 +11,10 @@
     "api/proxy.js": {
       "maxDuration": 190,
       "supportsCancellation": true
+    },
+    "api/garmin_auth.py": {
+      "runtime": "vercel-python@latest",
+      "maxDuration": 60
     }
   },
   "routes": [
