@@ -246,6 +246,56 @@ export async function completeConnectCredentials(adapterId, { email, password, p
   return complete({ email, password, profileId });
 }
 
+/**
+ * Finalize a credentials-based connect: store tokens in the encrypted vault,
+ * fetch account info, and kick off background backfill — mirroring the OAuth
+ * completion flow for adapters like Garmin Connect that use email/password.
+ */
+export async function finalizeCredentialsConnect(adapterId, result, profileId = getActiveProfileId()) {
+  const adapter = adapterById(adapterId);
+  if (!adapter) throw new Error(`Unknown adapter: ${adapterId}`);
+  if (!result.ok) throw new Error(result.error || 'Credentials connect failed');
+  const disp = OAUTH_DISPATCH[adapterId];
+  const displayName = disp?.displayName || adapter.displayName;
+
+  // Persist tokens to the encrypted credential vault first.
+  await saveConnectionWithCredentials(adapterId, {
+    accessToken: result.tokens.accessToken,
+    refreshToken: result.tokens.refreshToken,
+    expiresAt: result.tokens.expiresAt,
+    userId: result.tokens.userId || null,
+    connectedAt: new Date().toISOString(),
+    account: null,
+    lastSyncAt: 0,
+  }, profileId);
+
+  // Fetch account info (name, avatar, etc.) if the adapter supports it.
+  if (typeof disp?.fetchAccountInfo === 'function') {
+    try {
+      const info = await disp.fetchAccountInfo(result.tokens.accessToken, { userId: result.tokens.userId || null });
+      if (info?.ok) {
+        saveConnection(adapterId, { ...getConnection(adapterId), account: info.account });
+      }
+    } catch (e) {
+      if (isDebugMode?.()) console.warn(`[wearables] ${displayName} fetchAccountInfo failed:`, e);
+    }
+  }
+
+  // Kick off background backfill (90 days) — same pattern as OAuth.
+  const profileAtConnect = getActiveProfileId();
+  (async () => {
+    try {
+      const bf = await backfillWearable(adapterId);
+      if (getActiveProfileId() === profileAtConnect) {
+        await syncWearableSummary(profileAtConnect, listConnectedSources());
+      }
+      showNotification?.(`${displayName} backfilled ${bf.rows} days`, 'success');
+    } catch (e) {
+      showNotification?.(`${displayName} backfill failed: ${_scrubError(getErrorMessage(e))}`, 'error', 5000);
+    }
+  })();
+}
+
 // Per-adapter OAuth wiring table. Keeps the orchestrator out of vendor-specific
 // branch logic — new adapters register here once and flow through generically.
 export const OAUTH_DISPATCH = {

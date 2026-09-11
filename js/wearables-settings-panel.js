@@ -19,6 +19,7 @@ import { groupWearableAdapters, requestHostedWearableRelayConsent, withdrawHoste
 import {
   beginConnectOAuth,
   completeConnectCredentials,
+  finalizeCredentialsConnect,
   backfillWearable,
   disconnectWearable,
   syncNow,
@@ -677,14 +678,17 @@ async function handleWearableConnect(adapterId) {
       const creds = await promptGarminCredentials(adapter.displayName);
       if (!creds) return; // user cancelled
       showNotification?.(`Connecting to ${adapter.displayName}…`, 'info', 5000);
-      await completeConnectCredentials(adapterId, {
+      const result = await completeConnectCredentials(adapterId, {
         email: creds.email,
         password: creds.password,
         profileId: initiatingProfileId,
       });
-      showNotification?.(`${adapter.displayName} connected successfully.`, 'success', 4000);
-      // Trigger backfill + re-render
-      void backfillWearable(adapterId).catch(() => {});
+      if (!result.ok) {
+        showNotification?.(`${adapter.displayName} connection failed: ${result.error}`, 'error', 5000);
+        return;
+      }
+      showNotification?.(`${adapter.displayName} connected — backfilling 90 days in background…`, 'info', 4000);
+      await finalizeCredentialsConnect(adapterId, result, initiatingProfileId);
       navigateWearablesDashboard();
       return;
     }
