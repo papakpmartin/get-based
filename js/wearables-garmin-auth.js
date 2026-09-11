@@ -66,6 +66,10 @@ export function clearPendingCredentialsState() {
  * @param {{ email: string, password: string, profileId?: string | null }} args
  * @returns {Promise<{ ok: true, tokens: object, profileId?: string | null } | { ok: false, error: string, status?: number | null }>}
  */
+/**
+ * @param {{ email: string, password: string, profileId?: string|null }} params
+ * @returns {Promise<{ ok: boolean, tokens?: object, error?: string, status?: number, mfa_required?: boolean, mfa_method?: string, session?: string, profileId?: string|null }>}
+ */
 export async function completeCredentialsConnect({ email, password, profileId = null }) {
   const pending = getPendingCredentialsState();
   if (pending && typeof pending.startedAt === 'number' && Date.now() - pending.startedAt > 10 * 60 * 1000) {
@@ -82,6 +86,17 @@ export async function completeCredentialsConnect({ email, password, profileId = 
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
+    // MFA required — return session token for later verification
+    if (body?.mfa_required) {
+      return {
+        ok: false,
+        mfa_required: true,
+        mfa_method: /** @type {string} */ (body.mfa_method || 'email'),
+        session: /** @type {string} */ (body.session || ''),
+        error: /** @type {string} */ (body?.error || 'MFA required'),
+        status: res.status,
+      };
+    }
     return {
       ok: false,
       error: body?.error_description || body?.error || body?.message || `Garmin sign-in failed (${res.status})`,
@@ -92,6 +107,40 @@ export async function completeCredentialsConnect({ email, password, profileId = 
     return { ok: false, error: body?.error || 'Garmin sign-in returned no session token' };
   }
 
+  clearPendingCredentialsState();
+  return {
+    ok: true,
+    tokens: normalizeTokenResponse(body),
+    profileId: pending?.profileId || profileId || null,
+  };
+}
+
+/**
+ * Complete MFA verification after initial login returned mfa_required.
+ * @param {{ session: string, code: string, profileId?: string|null }} params
+ * @returns {Promise<{ok: boolean, tokens?: object, error?: string, status?: number, profileId?: string|null}>}
+ */
+export async function completeMfaVerification({ session, code, profileId = null }) {
+  const res = await fetch(PROXY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      garmin_mfa: { session, code },
+    }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    return {
+      ok: false,
+      error: body?.error_description || body?.error || body?.message || `Garmin MFA verification failed (${res.status})`,
+      status: res.status,
+    };
+  }
+  if (!body?.access_token) {
+    return { ok: false, error: body?.error || 'Garmin MFA verification returned no session token' };
+  }
+
+  const pending = getPendingCredentialsState();
   clearPendingCredentialsState();
   return {
     ok: true,

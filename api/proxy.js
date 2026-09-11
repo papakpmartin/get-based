@@ -938,7 +938,18 @@ async function garminLogin(email, password) {
 
   if (respType === 'MFA_REQUIRED') {
     const mfaInfo = loginBody?.customerMfaInfo || {};
-    return { mfa_required: true, mfa_method: mfaInfo.mfaLastMethodUsed || 'email' };
+    return {
+      mfa_required: true,
+      mfa_method: mfaInfo.mfaLastMethodUsed || 'email',
+      session: Buffer.from(JSON.stringify({
+        cookies: Array.from(cookies.map.entries()),
+        login_params: {
+          clientId: GARMIN_CLIENT_ID,
+          locale: 'en-US',
+          service: serviceUrl,
+        },
+      })).toString('base64'),
+    };
   }
 
   if (loginRes.status === 401 || respType === 'INVALID_CREDENTIALS') {
@@ -979,9 +990,112 @@ async function garminRefreshToken(refreshToken) {
   return await res.json();
 }
 
+async function garminCompleteMfa(sessionState, mfaCode) {
+  const state = JSON.parse(Buffer.from(sessionState, 'base64').toString('utf-8'));
+  const cookies = new GarminCookieJar();
+  cookies.map = new Map(state.cookies);
+  const loginParams = state.login_params;
+  const consumer = await getGarminConsumer();
+
+  // POST MFA code to SSO verifyCode endpoint
+  const mfaUrl = new URL(`https://sso.${GARMIN_DOMAIN}/mobile/api/mfa/verifyCode`);
+  for (const [k, v] of Object.entries(loginParams)) mfaUrl.searchParams.set(k, v);
+
+  const mfaRes = await garminFetch(mfaUrl.href, {
+    method: 'POST',
+    headers: {
+      'User-Agent': GARMIN_SSO_UA,
+      'Content-Type': 'application/json',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: JSON.stringify({
+      mfaMethod: state.mfa_method || 'email',
+      mfaVerificationCode: mfaCode,
+      rememberMyBrowser: false,
+      reconsentList: [],
+      mfaSetup: false,
+    }),
+  }, cookies);
+
+  const mfaBody = await mfaRes.json().catch(() => ({}));
+  const respType = mfaBody?.responseStatus?.type;
+
+  if (respType !== 'SUCCESSFUL') {
+    const detail = mfaBody?.responseStatus?.message || respType || 'unknown';
+    const err = new Error(`Garmin MFA verification failed: ${detail}`);
+    err.status = 401;
+    throw err;
+  }
+
+  const ticket = mfaBody.serviceTicketId;
+  const serviceUrl = loginParams.service;
+
+  // Best-effort: GET embed page for Cloudflare LB cookie
+  try {
+    const embedUrl = new URL(`https://sso.${GARMIN_DOMAIN}/portal/sso/embed`);
+    await garminFetch(embedUrl.href, { method: 'GET' }, cookies, {
+      'User-Agent': GARMIN_SSO_UA,
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      Referer: `https://sso.${GARMIN_DOMAIN}/`,
+    });
+  } catch { /* best-effort */ }
+
+  // Step 3: Get OAuth1 token via service ticket
+  const oauthBaseUrl = `https://connectapi.${GARMIN_DOMAIN}/oauth-service/oauth/`;
+  const preauthUrl = `${oauthBaseUrl}preauthorized?ticket=${encodeURIComponent(ticket)}&login-url=${encodeURIComponent(serviceUrl)}&accepts-mfa-tokens=true`;
+  const authHeader1 = signGarminOAuth1({
+    method: 'GET', url: preauthUrl,
+    consumerKey: consumer.consumer_key, consumerSecret: consumer.consumer_secret,
+  });
+  const oauth1Res = await garminFetch(preauthUrl, {
+    method: 'GET',
+    headers: { 'User-Agent': GARMIN_OAUTH_UA, Authorization: authHeader1 },
+  }, cookies);
+  if (!oauth1Res.ok) {
+    const text = await oauth1Res.text().catch(() => '');
+    throw new Error(`Garmin OAuth1 token failed: ${oauth1Res.status} ${text}`);
+  }
+  const oauth1Params = new URLSearchParams(await oauth1Res.text());
+  const oauth1 = {
+    oauth_token: oauth1Params.get('oauth_token'),
+    oauth_token_secret: oauth1Params.get('oauth_token_secret'),
+    mfa_token: oauth1Params.get('mfa_token') || null,
+  };
+
+  // Step 4: Exchange OAuth1 for OAuth2
+  const exchangeUrl = `${oauthBaseUrl}exchange/user/2.0`;
+  const formData = new URLSearchParams();
+  formData.set('audience', 'GARMIN_CONNECT_MOBILE_ANDROID_DI');
+  if (oauth1.mfa_token) formData.set('mfa_token', oauth1.mfa_token);
+  const authHeader2 = signGarminOAuth1({
+    method: 'POST', url: exchangeUrl,
+    consumerKey: consumer.consumer_key, consumerSecret: consumer.consumer_secret,
+    tokenKey: oauth1.oauth_token, tokenSecret: oauth1.oauth_token_secret,
+  });
+  const exchangeRes = await garminFetch(exchangeUrl, {
+    method: 'POST',
+    headers: {
+      'User-Agent': GARMIN_OAUTH_UA,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Authorization: authHeader2,
+    },
+    body: formData.toString(),
+  }, cookies);
+  if (!exchangeRes.ok) {
+    const text = await exchangeRes.text().catch(() => '');
+    throw new Error(`Garmin OAuth2 exchange failed: ${exchangeRes.status} ${text}`);
+  }
+  const oauth2 = await exchangeRes.json();
+  return { oauth1, oauth2 };
+}
+
 async function handleGarminAuthRequest(payload, req) {
-  const action = payload.garmin_credentials ? 'login' : 'refresh';
-  const input = payload.garmin_credentials || payload.garmin_token_refresh;
+  // Three action types: login, mfa_verify, refresh
+  const action = payload.garmin_credentials ? 'login'
+    : payload.garmin_mfa ? 'mfa_verify'
+    : 'refresh';
+  const input = payload.garmin_credentials || payload.garmin_mfa || payload.garmin_token_refresh;
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     return new Response(JSON.stringify({ error: `garmin_${action === 'login' ? 'credentials' : 'token_refresh'} requires an object payload` }), {
       status: 400,
@@ -989,25 +1103,45 @@ async function handleGarminAuthRequest(payload, req) {
     });
   }
 
-  const required = action === 'login' ? ['email', 'password'] : ['refresh_token'];
-  for (const key of required) {
-    if (!input[key]) {
-      return new Response(JSON.stringify({ error: `garmin_${action === 'login' ? 'credentials' : 'token_refresh'} requires ${key}` }), {
-        status: 400,
-        headers: { ...corsHeaders(req), 'Content-Type': 'application/json' },
-      });
-    }
+  // Validate required fields per action
+  if (action === 'login') {
+    if (!input.email || !input.password)
+      return new Response(JSON.stringify({ error: 'garmin_credentials requires email and password' }), { status: 400, headers: { ...corsHeaders(req), 'Content-Type': 'application/json' } });
+  } else if (action === 'mfa_verify') {
+    if (!input.session || !input.code)
+      return new Response(JSON.stringify({ error: 'garmin_mfa requires session and code' }), { status: 400, headers: { ...corsHeaders(req), 'Content-Type': 'application/json' } });
+  } else {
+    if (!input.refresh_token)
+      return new Response(JSON.stringify({ error: 'garmin_token_refresh requires refresh_token' }), { status: 400, headers: { ...corsHeaders(req), 'Content-Type': 'application/json' } });
   }
 
   try {
     if (action === 'login') {
       const result = await garminLogin(input.email, input.password);
       if (result.mfa_required) {
-        return new Response(JSON.stringify({ error: 'MFA required', mfa_required: true, mfa_method: result.mfa_method }), {
+        return new Response(JSON.stringify({
+          error: 'MFA required',
+          mfa_required: true,
+          mfa_method: result.mfa_method,
+          session: result.session,
+        }), {
           status: 401,
           headers: { ...corsHeaders(req), 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
         });
       }
+      const { oauth1, oauth2 } = result;
+      return new Response(JSON.stringify({
+        access_token: oauth2.access_token,
+        refresh_token: oauth1ToRefreshToken(oauth1),
+        expires_in: oauth2.expires_in,
+        refresh_token_expires_in: oauth2.refresh_token_expires_in || null,
+        token_type: oauth2.token_type,
+      }), {
+        status: 200,
+        headers: { ...corsHeaders(req), 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+      });
+    } else if (action === 'mfa_verify') {
+      const result = await garminCompleteMfa(input.session, input.code);
       const { oauth1, oauth2 } = result;
       return new Response(JSON.stringify({
         access_token: oauth2.access_token,
@@ -1034,7 +1168,7 @@ async function handleGarminAuthRequest(payload, req) {
     }
   } catch (error) {
     const status = error.status || 502;
-    const message = status === 401 ? 'Invalid Garmin credentials.' : 'Garmin authentication service unavailable.';
+    const message = status === 401 ? 'Invalid Garmin credentials or MFA code.' : 'Garmin authentication service unavailable.';
     console.error('[garmin_auth]', error.message);
     return new Response(JSON.stringify({ error: message }), {
       status,

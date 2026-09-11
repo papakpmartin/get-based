@@ -678,11 +678,25 @@ async function handleWearableConnect(adapterId) {
       const creds = await promptGarminCredentials(adapter.displayName);
       if (!creds) return; // user cancelled
       showNotification?.(`Connecting to ${adapter.displayName}…`, 'info', 5000);
-      const result = await completeConnectCredentials(adapterId, {
+      let result = await completeConnectCredentials(adapterId, {
         email: creds.email,
         password: creds.password,
         profileId: initiatingProfileId,
       });
+
+      // Handle MFA: prompt for code and verify
+      if (!result.ok && result.mfa_required) {
+        const mfaCode = await promptGarminMfaCode(adapter.displayName, result.mfa_method);
+        if (!mfaCode) return; // user cancelled MFA
+        showNotification?.(`Verifying MFA code…`, 'info', 5000);
+        const { completeMfaVerification } = await import('./wearables-garmin-auth.js');
+        result = await completeMfaVerification({
+          session: result.session,
+          code: mfaCode,
+          profileId: initiatingProfileId,
+        });
+      }
+
       if (!result.ok) {
         const errMsg = typeof result.error === 'string' ? result.error : JSON.stringify(result.error) || 'Unknown error';
         console.error('[garmin] connect failed:', result);
@@ -769,6 +783,71 @@ function promptGarminCredentials(displayName) {
       close({ email, password });
     };
     emailInput.focus();
+  });
+}
+
+/**
+ * Show a modal dialog prompting for Garmin MFA verification code.
+ * Returns the code string or null if the user cancelled.
+ */
+function promptGarminMfaCode(displayName, mfaMethod) {
+  return new Promise((resolve) => {
+    let overlay = document.getElementById('confirm-dialog-overlay');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = 'confirm-dialog-overlay';
+      overlay.className = 'confirm-overlay';
+      document.body.appendChild(overlay);
+    }
+    const methodLabel = mfaMethod === 'sms' ? 'text message' : 'email';
+    overlay.innerHTML = `<div class="confirm-dialog" role="dialog" aria-modal="true" aria-label="${escapeHTML(displayName)} MFA">
+      <p class="confirm-message">Enter the verification code sent to your ${methodLabel} for ${escapeHTML(displayName)}.</p>
+      <div style="display:flex;flex-direction:column;gap:10px;margin:16px 0;">
+        <input type="text" id="garmin-mfa-code" placeholder="Verification code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" style="padding:8px 12px;border:1px solid var(--border-color,#ccc);border-radius:6px;font-size:14px;background:var(--surface-color,#fff);color:var(--text-color,#333);text-align:center;letter-spacing:4px;" />
+      </div>
+      <div class="confirm-actions">
+        <button class="confirm-btn confirm-btn-cancel" id="garmin-mfa-cancel">Cancel</button>
+        <button class="confirm-btn confirm-btn-primary" id="garmin-mfa-verify">Verify</button>
+      </div></div>`;
+    const codeInput = /** @type {HTMLInputElement | null} */ (overlay.querySelector('#garmin-mfa-code'));
+    const verifyBtn = /** @type {HTMLButtonElement | null} */ (overlay.querySelector('#garmin-mfa-verify'));
+    const cancelBtn = /** @type {HTMLButtonElement | null} */ (overlay.querySelector('#garmin-mfa-cancel'));
+    if (!verifyBtn || !cancelBtn || !codeInput) {
+      resolve(null);
+      return;
+    }
+    let settled = false;
+    const cleanup = () => {
+      document.removeEventListener('keydown', onKey);
+      overlay.onclick = null;
+      delete overlay.dataset.escapeOwner;
+    };
+    const close = (result) => {
+      if (settled) return;
+      settled = true;
+      overlay.style.display = 'none';
+      overlay.innerHTML = '';
+      cleanup();
+      resolve(result);
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { close(null); }
+      if (e.key === 'Enter' && document.activeElement === codeInput) {
+        const code = codeInput.value.trim();
+        if (code) close(code);
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    overlay.onclick = (e) => { if (e.target === overlay) close(null); };
+    overlay.dataset.escapeOwner = 'garmin-mfa';
+    overlay.style.display = 'flex';
+    cancelBtn.onclick = () => close(null);
+    verifyBtn.onclick = () => {
+      const code = codeInput.value.trim();
+      if (!code) { codeInput.focus(); return; }
+      close(code);
+    };
+    codeInput.focus();
   });
 }
 
