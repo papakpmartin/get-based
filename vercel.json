@@ -12,8 +12,7 @@
       "maxDuration": 190,
       "supportsCancellation": true
     },
-    "api/garmin_auth.py": {
-      "runtime": "vercel-python@latest",
+    "api/garmin_auth.js": {
       "maxDuration": 60
     }
   },

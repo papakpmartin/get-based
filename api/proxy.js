@@ -769,6 +769,7 @@ async function handleGarminAuthRequest(payload, req) {
   }
 
   const body = JSON.stringify({ action, ...input });
+  // Forward to the Node.js garmin_auth handler (same Vercel project).
   const target = garminAuthInternalUrl(req);
   try {
     const upstream = await fetch(target, {
@@ -793,11 +794,11 @@ async function handleGarminAuthRequest(payload, req) {
 function garminAuthInternalUrl(req) {
   const deploymentUrl = req.headers.get('x-vercel-deployment-url');
   const envUrl = typeof process !== 'undefined' ? process.env?.VERCEL_URL : undefined;
-  if (deploymentUrl) return `https://${deploymentUrl}/api/garmin_auth.py`;
-  if (envUrl) return `https://${envUrl}/api/garmin_auth.py`;
+  if (deploymentUrl) return `https://${deploymentUrl}/api/garmin_auth`;
+  if (envUrl) return `https://${envUrl}/api/garmin_auth`;
   try {
-    return new URL('/api/garmin_auth.py', new URL(req.url).origin).href;
+    return new URL('/api/garmin_auth', new URL(req.url).origin).href;
   } catch {
-    return '/api/garmin_auth.py';
+    return '/api/garmin_auth';
   }
 }
