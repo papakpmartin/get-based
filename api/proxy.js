@@ -744,10 +744,241 @@ async function handleGoogleHealthTokenRequest(payload, req) {
   }, req, 'Google OAuth token endpoint unavailable');
 }
 
-// ─── Garmin auth handler ─────────────────────────────────────────
-// Forwards credential login and token refresh to the Python serverless function
-// that performs Garmin's OAuth1 → OAuth2 exchange. Generic connect/connectapi
-// data requests bypass this and use the standard proxy path below.
+// ─── Garmin auth (inlined — no separate function) ────────────────
+// Ports garth library's OAuth1 → OAuth2 exchange directly into the proxy
+// to avoid Vercel deployment protection blocking internal function calls.
+// Flow: SSO login → service ticket → OAuth1 token (HMAC-SHA1) → OAuth2 exchange.
+
+import crypto from 'node:crypto';
+
+const GARMIN_CLIENT_ID = 'GCM_ANDROID_DARK';
+const GARMIN_OAUTH_CONSUMER_URL = 'https://thegarth.s3.amazonaws.com/oauth_consumer.json';
+const GARMIN_DOMAIN = 'garmin.com';
+const GARMIN_SSO_UA =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) ' +
+  'AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148';
+const GARMIN_OAUTH_UA = 'com.garmin.android.apps.connectmobile';
+
+let _garminConsumer = null;
+async function getGarminConsumer() {
+  if (_garminConsumer) return _garminConsumer;
+  const res = await fetch(GARMIN_OAUTH_CONSUMER_URL);
+  if (!res.ok) throw new Error(`Failed to fetch Garmin OAuth consumer: ${res.status}`);
+  _garminConsumer = await res.json();
+  return _garminConsumer;
+}
+
+class GarminCookieJar {
+  constructor() { this.map = new Map(); }
+  capture(headers) {
+    if (!headers) return;
+    const arr = Array.isArray(headers) ? headers : [headers];
+    for (const raw of arr) {
+      if (!raw) continue;
+      const part = raw.split(';')[0].trim();
+      const eq = part.indexOf('=');
+      if (eq > 0) this.map.set(part.slice(0, eq).trim(), part.slice(eq + 1).trim());
+    }
+  }
+  header() {
+    return this.map.size ? Array.from(this.map, ([k, v]) => `${k}=${v}`).join('; ') : undefined;
+  }
+}
+
+function garminPercentEncode(str) {
+  return encodeURIComponent(str)
+    .replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+}
+
+function signGarminOAuth1({ method, url, consumerKey, consumerSecret, tokenKey, tokenSecret }) {
+  const params = {
+    oauth_consumer_key: consumerKey,
+    oauth_signature_method: 'HMAC-SHA1',
+    oauth_timestamp: String(Math.floor(Date.now() / 1000)),
+    oauth_nonce: crypto.randomBytes(16).toString('hex'),
+    oauth_version: '1.0',
+  };
+  if (tokenKey) params.oauth_token = tokenKey;
+
+  const encoded = Object.entries(params)
+    .map(([k, v]) => [garminPercentEncode(String(k)), garminPercentEncode(String(v))])
+    .sort(([a1, a2], [b1, b2]) => (a1 < b1 ? -1 : a1 > b1 ? 1 : a2 < b2 ? -1 : a2 > b2 ? 1 : 0));
+  const paramString = encoded.map(([k, v]) => `${k}=${v}`).join('&');
+  const baseUrl = url.split('#')[0].split('?')[0];
+  const signatureBase = [method.toUpperCase(), garminPercentEncode(baseUrl), garminPercentEncode(paramString)].join('&');
+  const signingKey = `${garminPercentEncode(consumerSecret)}&${garminPercentEncode(tokenSecret || '')}`;
+  const signature = crypto.createHmac('sha1', signingKey).update(signatureBase).digest('base64');
+  const authParams = { ...params, oauth_signature: signature };
+  return 'OAuth ' + Object.entries(authParams).map(([k, v]) => `${garminPercentEncode(k)}="${garminPercentEncode(String(v))}"`).join(',');
+}
+
+async function garminFetch(url, options, cookies, extraHeaders = {}) {
+  const cookieHeader = cookies.header();
+  const headers = { ...extraHeaders };
+  if (cookieHeader) headers.Cookie = cookieHeader;
+  const res = await fetch(url, {
+    ...options,
+    headers: { ...headers, ...(options?.headers || {}) },
+    redirect: 'manual',
+  });
+  const setCookie = res.headers.getsetcookie?.();
+  if (setCookie) cookies.capture(setCookie);
+  else { const sc = res.headers.get('set-cookie'); if (sc) cookies.capture(sc); }
+  return res;
+}
+
+function oauth1ToRefreshToken(oauth1) {
+  return Buffer.from(JSON.stringify({
+    oauth_token: oauth1.oauth_token,
+    oauth_token_secret: oauth1.oauth_token_secret,
+  })).toString('base64');
+}
+
+function refreshTokenToOAuth1(refreshToken) {
+  return JSON.parse(Buffer.from(refreshToken, 'base64').toString('utf-8'));
+}
+
+async function garminLogin(email, password) {
+  const cookies = new GarminCookieJar();
+  const consumer = await getGarminConsumer();
+  const serviceUrl = `https://mobile.integration.${GARMIN_DOMAIN}/gcm/android`;
+
+  // Step 1: GET SSO sign-in page (sets cookies)
+  const ssoUrl = new URL(`https://sso.${GARMIN_DOMAIN}/mobile/sso/en/sign-in`);
+  ssoUrl.searchParams.set('clientId', GARMIN_CLIENT_ID);
+  await garminFetch(ssoUrl.href, { method: 'GET' }, cookies, {
+    'User-Agent': GARMIN_SSO_UA,
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Site': 'none',
+  });
+
+  // Step 2: POST credentials to SSO login API
+  const loginUrl = new URL(`https://sso.${GARMIN_DOMAIN}/mobile/api/login`);
+  loginUrl.searchParams.set('clientId', GARMIN_CLIENT_ID);
+  loginUrl.searchParams.set('locale', 'en-US');
+  loginUrl.searchParams.set('service', serviceUrl);
+
+  const loginRes = await garminFetch(loginUrl.href, {
+    method: 'POST',
+    headers: {
+      'User-Agent': GARMIN_SSO_UA,
+      'Content-Type': 'application/json',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: JSON.stringify({ username: email, password, rememberMe: false, captchaToken: '' }),
+  }, cookies);
+
+  const loginBody = await loginRes.json().catch(() => ({}));
+  const respType = loginBody?.responseStatus?.type;
+
+  if (respType === 'SUCCESSFUL') {
+    const ticket = loginBody.serviceTicketId;
+    // Best-effort: GET embed page for Cloudflare LB cookie
+    try {
+      const embedUrl = new URL(`https://sso.${GARMIN_DOMAIN}/portal/sso/embed`);
+      await garminFetch(embedUrl.href, { method: 'GET' }, cookies, {
+        'User-Agent': GARMIN_SSO_UA,
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        Referer: `https://sso.${GARMIN_DOMAIN}/`,
+      });
+    } catch { /* best-effort */ }
+
+    // Step 3: Get OAuth1 token via service ticket
+    const oauthBaseUrl = `https://connectapi.${GARMIN_DOMAIN}/oauth-service/oauth/`;
+    const preauthUrl = `${oauthBaseUrl}preauthorized?ticket=${encodeURIComponent(ticket)}&login-url=${encodeURIComponent(serviceUrl)}&accepts-mfa-tokens=true`;
+    const authHeader1 = signGarminOAuth1({
+      method: 'GET', url: preauthUrl,
+      consumerKey: consumer.consumer_key, consumerSecret: consumer.consumer_secret,
+    });
+    const oauth1Res = await garminFetch(preauthUrl, {
+      method: 'GET',
+      headers: { 'User-Agent': GARMIN_OAUTH_UA, Authorization: authHeader1 },
+    }, cookies);
+    if (!oauth1Res.ok) {
+      const text = await oauth1Res.text().catch(() => '');
+      throw new Error(`Garmin OAuth1 token failed: ${oauth1Res.status} ${text}`);
+    }
+    const oauth1Params = new URLSearchParams(await oauth1Res.text());
+    const oauth1 = {
+      oauth_token: oauth1Params.get('oauth_token'),
+      oauth_token_secret: oauth1Params.get('oauth_token_secret'),
+      mfa_token: oauth1Params.get('mfa_token') || null,
+    };
+
+    // Step 4: Exchange OAuth1 for OAuth2
+    const exchangeUrl = `${oauthBaseUrl}exchange/user/2.0`;
+    const formData = new URLSearchParams();
+    formData.set('audience', 'GARMIN_CONNECT_MOBILE_ANDROID_DI');
+    if (oauth1.mfa_token) formData.set('mfa_token', oauth1.mfa_token);
+    const authHeader2 = signGarminOAuth1({
+      method: 'POST', url: exchangeUrl,
+      consumerKey: consumer.consumer_key, consumerSecret: consumer.consumer_secret,
+      tokenKey: oauth1.oauth_token, tokenSecret: oauth1.oauth_token_secret,
+    });
+    const exchangeRes = await garminFetch(exchangeUrl, {
+      method: 'POST',
+      headers: {
+        'User-Agent': GARMIN_OAUTH_UA,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: authHeader2,
+      },
+      body: formData.toString(),
+    }, cookies);
+    if (!exchangeRes.ok) {
+      const text = await exchangeRes.text().catch(() => '');
+      throw new Error(`Garmin OAuth2 exchange failed: ${exchangeRes.status} ${text}`);
+    }
+    const oauth2 = await exchangeRes.json();
+    return { oauth1, oauth2 };
+  }
+
+  if (respType === 'MFA_REQUIRED') {
+    const mfaInfo = loginBody?.customerMfaInfo || {};
+    return { mfa_required: true, mfa_method: mfaInfo.mfaLastMethodUsed || 'email' };
+  }
+
+  if (loginRes.status === 401 || respType === 'INVALID_CREDENTIALS') {
+    const err = new Error('Invalid Garmin credentials.');
+    err.status = 401;
+    throw err;
+  }
+
+  const detail = loginBody?.responseStatus?.message || respType || 'unknown';
+  const err = new Error(`Garmin SSO error: ${detail}`);
+  err.status = 502;
+  throw err;
+}
+
+async function garminRefreshToken(refreshToken) {
+  const oauth1 = refreshTokenToOAuth1(refreshToken);
+  const consumer = await getGarminConsumer();
+  const cookies = new GarminCookieJar();
+  const oauthBaseUrl = `https://connectapi.${GARMIN_DOMAIN}/oauth-service/oauth/`;
+  const exchangeUrl = `${oauthBaseUrl}exchange/user/2.0`;
+  const authHeader = signGarminOAuth1({
+    method: 'POST', url: exchangeUrl,
+    consumerKey: consumer.consumer_key, consumerSecret: consumer.consumer_secret,
+    tokenKey: oauth1.oauth_token, tokenSecret: oauth1.oauth_token_secret,
+  });
+  const res = await garminFetch(exchangeUrl, {
+    method: 'POST',
+    headers: {
+      'User-Agent': GARMIN_OAUTH_UA,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Authorization: authHeader,
+    },
+  }, cookies);
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Garmin token refresh failed: ${res.status} ${text}`);
+  }
+  return await res.json();
+}
+
 async function handleGarminAuthRequest(payload, req) {
   const action = payload.garmin_credentials ? 'login' : 'refresh';
   const input = payload.garmin_credentials || payload.garmin_token_refresh;
@@ -768,37 +999,46 @@ async function handleGarminAuthRequest(payload, req) {
     }
   }
 
-  const body = JSON.stringify({ action, ...input });
-  // Forward to the Node.js garmin_auth handler (same Vercel project).
-  const target = garminAuthInternalUrl(req);
   try {
-    const upstream = await fetch(target, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body,
-      signal: req.signal,
-    });
-    const upstreamBody = await readResponseTextWithCap(upstream, PROXY_MAX_CREDENTIAL_RESPONSE_BYTES);
-    return new Response(upstreamBody, {
-      status: upstream.status,
-      headers: {
-        ...corsHeaders(req),
-        'Content-Type': upstream.headers.get('content-type') || 'application/json',
-      },
-    });
+    if (action === 'login') {
+      const result = await garminLogin(input.email, input.password);
+      if (result.mfa_required) {
+        return new Response(JSON.stringify({ error: 'MFA required', mfa_required: true, mfa_method: result.mfa_method }), {
+          status: 401,
+          headers: { ...corsHeaders(req), 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+        });
+      }
+      const { oauth1, oauth2 } = result;
+      return new Response(JSON.stringify({
+        access_token: oauth2.access_token,
+        refresh_token: oauth1ToRefreshToken(oauth1),
+        expires_in: oauth2.expires_in,
+        refresh_token_expires_in: oauth2.refresh_token_expires_in || null,
+        token_type: oauth2.token_type,
+      }), {
+        status: 200,
+        headers: { ...corsHeaders(req), 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+      });
+    } else {
+      const oauth2 = await garminRefreshToken(input.refresh_token);
+      return new Response(JSON.stringify({
+        access_token: oauth2.access_token,
+        refresh_token: input.refresh_token,
+        expires_in: oauth2.expires_in,
+        refresh_token_expires_in: oauth2.refresh_token_expires_in || null,
+        token_type: oauth2.token_type,
+      }), {
+        status: 200,
+        headers: { ...corsHeaders(req), 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+      });
+    }
   } catch (error) {
-    return proxyUpstreamErrorResponse(req, error, 'Garmin auth service unavailable');
-  }
-}
-
-function garminAuthInternalUrl(req) {
-  const deploymentUrl = req.headers.get('x-vercel-deployment-url');
-  const envUrl = typeof process !== 'undefined' ? process.env?.VERCEL_URL : undefined;
-  if (deploymentUrl) return `https://${deploymentUrl}/api/garmin_auth`;
-  if (envUrl) return `https://${envUrl}/api/garmin_auth`;
-  try {
-    return new URL('/api/garmin_auth', new URL(req.url).origin).href;
-  } catch {
-    return '/api/garmin_auth';
+    const status = error.status || 502;
+    const message = status === 401 ? 'Invalid Garmin credentials.' : 'Garmin authentication service unavailable.';
+    console.error('[garmin_auth]', error.message);
+    return new Response(JSON.stringify({ error: message }), {
+      status,
+      headers: { ...corsHeaders(req), 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+    });
   }
 }

@@ -684,7 +684,9 @@ async function handleWearableConnect(adapterId) {
         profileId: initiatingProfileId,
       });
       if (!result.ok) {
-        showNotification?.(`${adapter.displayName} connection failed: ${result.error}`, 'error', 5000);
+        const errMsg = typeof result.error === 'string' ? result.error : JSON.stringify(result.error) || 'Unknown error';
+        console.error('[garmin] connect failed:', result);
+        showNotification?.(`${adapter.displayName} connection failed: ${errMsg}`, 'error', 8000);
         return;
       }
       showNotification?.(`${adapter.displayName} connected — backfilling 90 days in background…`, 'info', 4000);
